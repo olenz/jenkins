@@ -26,29 +26,42 @@ package hudson.tasks;
 
 import hudson.AbortException;
 import hudson.FilePath;
+import hudson.FilePath.FileCallable;
 import hudson.Launcher;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.Label;
 import hudson.model.Result;
+import hudson.model.Slave;
+import hudson.remoting.VirtualChannel;
 import static hudson.tasks.LogRotatorTest.build;
+
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.util.Collections;
 import java.util.List;
+
+import jenkins.MasterToSlaveFileCallable;
+import jenkins.security.MasterToSlaveCallable;
 import jenkins.util.VirtualFile;
 import static org.junit.Assert.*;
 import static org.junit.Assume.*;
 
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestBuilder;
 import org.jvnet.hudson.test.recipes.LocalData;
+import org.jvnet.hudson.test.recipes.WithTimeout;
 
 public class ArtifactArchiverTest {
     
@@ -248,6 +261,80 @@ public class ArtifactArchiverTest {
         assertTrue(artifacts.child("dir").child(".svn").child("file").exists());
     }
 
+    final static String LARGEFILE = "largefile";
+    final static long LARGEFILESIZE = 8L * 1025L * 1024L*1024L;
+    
+    static class CreateLargerThan8GBArtifact extends TestBuilder {
+        public boolean perform(AbstractBuild<?,?> build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
+        	FilePath largefile = build.getWorkspace().child(LARGEFILE);
+            OutputStream out = largefile.write();
+            // create byte array and fill it with data
+            byte[] oneMB = new byte[1024*1024];
+            for (int i = 0; i < oneMB.length; i++) { 
+            	oneMB[i] = (byte)(i%128); 
+            }
+            
+            // fill file with 1 MB chunks
+            for (int i = 0; i < LARGEFILESIZE/oneMB.length; i++) {
+            	out.write(oneMB);
+            }
+            out.close();
+            
+//            FilePath workspace = build.getWorkspace();
+//            workspace.act(new MasterToSlaveFileCallable<Void>() {
+//				private static final long serialVersionUID = 1L;
+//				@Override public Void invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+//            		// create new file with 8GB
+//            		String path = f.getPath() + File.separator + LARGEFILE;
+//            		RandomAccessFile largefile = new RandomAccessFile(path, "rw");
+////            		largefile.setLength(LARGEFILE_OFFSET);
+////            		largefile.seek(LARGEFILE_OFFSET);
+//            		largefile.write(42);
+//            		largefile.close();
+//                    return null;                    
+//                }
+//            });
+            return true;
+        }
+    }
+
+    @Test
+    @WithTimeout(300)
+    @Issue("JENKINS-10629")
+    public void testArchiveLargerThan8GBFromSlave() throws Exception {
+    	// check whether there is enough space left on the device before executing the test
+    	
+    	Slave slave = j.createSlave();
+
+    	FreeStyleProject project = j.createFreeStyleProject();
+        project.setAssignedNode(slave);
+        project.getPublishersList().replaceBy(Collections.singleton(
+        		new ArtifactArchiver(LARGEFILE)));
+                
+        project.getBuildersList().replaceBy(Collections.singleton(
+        		new CreateLargerThan8GBArtifact()));
+
+        // check that the build worked fine
+        assertEquals(Result.SUCCESS, build(project));
+
+        VirtualFile largefile= project.getBuildByNumber(1).getArtifactManager().root().child(LARGEFILE);
+        // check that the artifact was copied
+        assertTrue(largefile.exists());
+        // check that it has the right size
+        assertEquals(LARGEFILESIZE, largefile.length());
+
+        // read the data at the end of teh file that it is the expected data
+        InputStream ls = largefile.open();
+        ls.skip(LARGEFILESIZE-128);
+        byte[] expected = new byte[128];
+        for (int i = 0; i < 128; i++) {
+        	expected[i] = (byte)(i%128);
+        }
+        byte[] actual = new byte[128];
+        ls.read(actual);
+        assertArrayEquals(expected, actual);
+    }
+    
     @LocalData
     @Test public void latestOnlyMigration() throws Exception {
         FreeStyleProject p = j.jenkins.getItemByFullName("sample", FreeStyleProject.class);
